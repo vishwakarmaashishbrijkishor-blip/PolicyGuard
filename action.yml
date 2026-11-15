@@ -1,0 +1,119 @@
+name: PolicyGuard
+description: Evidence-linked, policy-as-code review of pull-request diffs.
+author: PolicyGuard Contributor - Ashish Brijkishor Vishwakarma
+
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  base:
+    description: Base ref to diff against. Defaults to origin/<pull request base branch>, or origin/main.
+    required: false
+    default: ""
+  head:
+    description: Head ref.
+    required: false
+    default: HEAD
+  ai:
+    description: Enable AI-assisted analysis. Needs POLICYGUARD_LLM_API_KEY in the environment.
+    required: false
+    default: "false"
+  fail-on:
+    description: Lowest severity that fails the job (info, warning, error, critical).
+    required: false
+    default: error
+  strict:
+    description: Treat warnings and analysis errors as failures.
+    required: false
+    default: "false"
+  config:
+    description: Path to a PolicyGuard configuration file.
+    required: false
+    default: ""
+  version:
+    description: npm version of policyguard to install. Use "source" to build from this action's checkout.
+    required: false
+    default: latest
+  upload-sarif:
+    description: Also generate SARIF and upload it to GitHub code scanning (needs security-events write permission).
+    required: false
+    default: "false"
+  working-directory:
+    description: Directory containing the repository.
+    required: false
+    default: .
+
+outputs:
+  exit-code:
+    description: Exit code of policyguard review.
+    value: ${{ steps.review.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 20
+
+    - name: Install PolicyGuard
+      shell: bash
+      env:
+        PG_VERSION: ${{ inputs.version }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        if [ "$PG_VERSION" = "source" ]; then
+          corepack enable
+          (cd "$ACTION_PATH" && pnpm install --frozen-lockfile && pnpm build && npm link)
+        else
+          npm install --global "policyguard@${PG_VERSION}"
+        fi
+
+    - name: Run PolicyGuard
+      id: review
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PG_BASE: ${{ inputs.base }}
+        PG_HEAD: ${{ inputs.head }}
+        PG_AI: ${{ inputs.ai }}
+        PG_FAIL_ON: ${{ inputs.fail-on }}
+        PG_STRICT: ${{ inputs.strict }}
+        PG_CONFIG: ${{ inputs.config }}
+        PG_SARIF: ${{ inputs.upload-sarif }}
+        PG_BASE_REF: ${{ github.base_ref }}
+      run: |
+        base="$PG_BASE"
+        if [ -z "$base" ]; then
+          if [ -n "$PG_BASE_REF" ]; then
+            base="origin/$PG_BASE_REF"
+            git fetch --no-tags origin "$PG_BASE_REF" || true
+          else
+            base="origin/main"
+          fi
+        fi
+        args=(review --base "$base" --head "$PG_HEAD" --fail-on "$PG_FAIL_ON" --github-annotations)
+        [ "$PG_AI" = "true" ] && args+=(--ai) || args+=(--no-ai)
+        [ "$PG_STRICT" = "true" ] && args+=(--strict)
+        [ -n "$PG_CONFIG" ] && args+=(--config "$PG_CONFIG")
+        set +e
+        policyguard "${args[@]}"
+        code=$?
+        if [ "$PG_SARIF" = "true" ]; then
+          sarif_args=("${args[@]}" --format sarif --output policyguard.sarif)
+          policyguard "${sarif_args[@]}" >/dev/null 2>&1
+        fi
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        exit 0
+
+    - name: Upload SARIF
+      if: inputs.upload-sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ inputs.working-directory }}/policyguard.sarif
+
+    - name: Apply exit code
+      shell: bash
+      env:
+        CODE: ${{ steps.review.outputs.exit-code }}
+      run: exit "${CODE:-0}"
